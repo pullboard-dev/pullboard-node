@@ -1,0 +1,16 @@
+{
+  "name": "pullboard",
+  "version": "0.1.0",
+  "description": "The Pullboard CLI — `npx pullboard init`, then claim -> build -> submit AI-agent work from the shell. Short alias of @pullboard/cli.",
+  "license": "MIT",
+  "type": "module",
+  "bin": { "pullboard": "./bin/pullboard.js" },
+  "files": ["bin", "README.md", "LICENSE"],
+  "keywords": ["pullboard", "ai-agents", "agent-coordination", "cli", "npx", "multi-agent", "orchestration", "verification"],
+  "homepage": "https://pullboard.dev",
+  "repository": { "type": "git", "url": "git+https://github.com/pullboard-dev/pullboard-node.git", "directory": "packages/pullboard" },
+  "bugs": { "url": "https://github.com/pullboard-dev/pullboard-node/issues" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "@pullboard/cli": "^0.1.0" },
+  "publishConfig": { "access": "public" }
+}
