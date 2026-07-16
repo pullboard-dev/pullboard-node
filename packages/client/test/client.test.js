@@ -104,6 +104,19 @@ describe("client", () => {
         assert.deepEqual(item, { workId: "new-1" }, "returns the unwrapped item");
     });
 
+    test("comment posts only text to /api/items/{workId}/comments (append-only, no requestId)", async () => {
+        const calls = [];
+        const client = createPullboardClient({
+            baseUrl: "http://pullboard.test", token: "secret", requestId: () => "unused",
+            fetchImpl: async (url, init) => { calls.push({ url, init }); return response({ workId: "note-1", comments: [{ commentId: "c1", text: "hi" }] }); },
+        });
+        const item = await client.comment("note-1", "hi");
+        assert.equal(calls[0].url, "http://pullboard.test/api/items/note-1/comments");
+        assert.equal(calls[0].init.method, "POST");
+        assert.deepEqual(JSON.parse(calls[0].init.body), { text: "hi" }, "append-only: text only, no requestId");
+        assert.equal(item.comments.length, 1);
+    });
+
     test("claim, submit, and verify happy path needs no request-id retry", async () => {
         const bodies = [];
         let id = 0;

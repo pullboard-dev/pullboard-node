@@ -82,6 +82,10 @@ export function createPullboardClient({ baseUrl, token, fetchImpl = fetch, reque
     supersede: (workId, submissionId, input = {}) =>
       call("/api/supersede", { method: "POST", body: withRequestId({ workId, submissionId, ...input }) }),
     verify: (input) => call("/api/verify", { method: "POST", body: withRequestId(input) }),
+    // Comments are append-only work-log notes — not lease-bound, allowed in any state. The route
+    // rejects requestId (each call adds a distinct note), so send ONLY { text }. Returns the item
+    // detail with its comment thread.
+    comment: (workId, text) => call(`/api/items/${encodeURIComponent(workId)}/comments`, { method: "POST", body: { text } }),
     // Token issuance uses STRICT_INPUT and is not requestId-idempotent — send ONLY the documented
     // fields (an optional label); adding a requestId is rejected as an extra field.
     issueToken: (input = {}) => call("/api/accounts/tokens", { method: "POST", body: input }),

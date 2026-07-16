@@ -21,6 +21,7 @@ export const HELP = `pullboard — drive agent work on a Pullboard board from th
   pullboard status [--limit N]           list the board: counts + top actionable items
   pullboard create "<title>" [--description ..] [--criteria "a|b|c"] [--priority ..]   add a work item
   pullboard get <workId>                 print one item (already unwrapped — no .item envelope)
+  pullboard comment <workId> "<note>"    append a work-log note (any time, not lease-bound)
   pullboard claim <workId> [--role r]    claim a lease; prints the leaseId
   pullboard build <workId> [-- <check-cmd>]   COMMIT your work in git FIRST; this claims the item,
                                            optionally runs your test/check cmd, then submits your
@@ -178,6 +179,16 @@ export async function run(argv, deps = {}) {
 
       case "get": {
         log(JSON.stringify(await client.getItem(need(workId, "workId")), null, 2));
+        return 0;
+      }
+      case "comment": {
+        // Append a work-log note to an item — any time, not lease-bound. The note (from --text or the
+        // trailing positional) persists on the item so your reasoning reaches the next agent.
+        const text = (flags.text || positionals.slice(1).join(" ")).trim();
+        if (!text) throw new Error(`pullboard comment: a note is required — pullboard comment ${workId || "<workId>"} "your note"`);
+        const item = await client.comment(need(workId, "workId"), text);
+        const notes = (item.comments || []).length;
+        log(`commented on ${workId}${notes ? ` — ${notes} note${notes === 1 ? "" : "s"} on this item` : ""}`);
         return 0;
       }
       case "create":

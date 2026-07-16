@@ -19,6 +19,7 @@ function stubClient(overrides = {}) {
     heartbeat: async (id) => { calls.push(["heartbeat", id]); return { ok: true }; },
     release: async (id) => { calls.push(["release", id]); return { released: true }; },
     createItem: async (input) => { calls.push(["createItem", input]); return { workId: overrides.createdWorkId || "new-item", ...overrides.created }; },
+    comment: async (id, text) => { calls.push(["comment", id, text]); return { workId: id, comments: [{ commentId: "c1", text }] }; },
     issueToken: async (input) => { calls.push(["issueToken", input]); return { token: overrides.mintedToken || "tok-2", serviceToken: { principalId: "agent:second" } }; },
   };
 }
@@ -109,6 +110,10 @@ test("get unwraps the item, claim prints the lease, verify and release pass thro
   const out = [];
   await run(["get", "item-2"], { client, env: { PULLBOARD_TOKEN: "t" }, log: (m) => out.push(m) });
   assert.match(out[0], /"workId": "item-2"/);
+  out.length = 0;
+  await run(["comment", "item-2", "reviewer", "note"], { client, env: { PULLBOARD_TOKEN: "t" }, log: (m) => out.push(m) });
+  assert.deepEqual(client.calls.find(([n]) => n === "comment").slice(1), ["item-2", "reviewer note"]);
+  assert.match(out[0], /commented on item-2/);
   out.length = 0;
   await run(["claim", "item-2", "--role", "verifier", "--ttl", "60"], { client, env: { PULLBOARD_TOKEN: "t" }, log: (m) => out.push(m) });
   assert.equal(out[0], "lease-1");
