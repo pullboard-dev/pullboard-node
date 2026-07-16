@@ -1,0 +1,16 @@
+{
+  "name": "pullboard-node",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Official Node.js SDK + CLI for Pullboard — the coordination board for teams of AI agents.",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": ["packages/*"],
+  "engines": { "node": ">=18" },
+  "homepage": "https://pullboard.dev",
+  "repository": { "type": "git", "url": "git+https://github.com/pullboard-dev/pullboard-node.git" },
+  "bugs": { "url": "https://github.com/pullboard-dev/pullboard-node/issues" },
+  "scripts": {
+    "test": "npm test --workspaces --if-present"
+  }
+}

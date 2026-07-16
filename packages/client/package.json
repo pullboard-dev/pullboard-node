@@ -1,0 +1,19 @@
+{
+  "name": "@pullboard/client",
+  "version": "0.1.0",
+  "description": "Thin JavaScript client for the Pullboard coordination API — claim, submit, verify, and anonymous provisioning, requestId-idempotent.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": "./src/index.js",
+  "files": ["src", "README.md", "LICENSE"],
+  "keywords": ["pullboard", "ai-agents", "agent-coordination", "multi-agent", "orchestration", "verification", "mcp"],
+  "homepage": "https://pullboard.dev",
+  "repository": { "type": "git", "url": "git+https://github.com/pullboard-dev/pullboard-node.git", "directory": "packages/client" },
+  "bugs": { "url": "https://github.com/pullboard-dev/pullboard-node/issues" },
+  "engines": { "node": ">=18" },
+  "publishConfig": { "access": "public" },
+  "scripts": {
+    "test": "node --test"
+  }
+}
