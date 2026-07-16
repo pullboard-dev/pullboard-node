@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 
+export { resolveToken } from "./token.js";
+
 /**
  * Create a token-authenticated client for Pullboard's coordination API.
  *
@@ -45,6 +47,10 @@ export function createPullboardClient({ baseUrl, token, fetchImpl = fetch, reque
       // Preserve the stable Pullboard error code when supplied.
       error.code = payload.error;
 
+      // Preserve the server's own remediation guidance so callers can print it verbatim.
+      if (payload.fix) error.fix = payload.fix;
+      if (payload.docs) error.docs = payload.docs;
+
       // Reject the operation with the enriched client error.
       throw error;
     }
@@ -63,7 +69,9 @@ export function createPullboardClient({ baseUrl, token, fetchImpl = fetch, reque
 
   // Publish the complete client surface without allowing operation replacement.
   return Object.freeze({
+    getStatus: (query = "") => call(`/api/status${query}`),
     getItem: async (workId) => (await call(`/api/items/${encodeURIComponent(workId)}`)).item,
+    createItem: async (input) => (await call("/api/items", { method: "POST", body: withRequestId(input) })).item,
     claim: (workId, { role = "builder", ttl = 3600, ...input } = {}) =>
       call("/api/claim", { method: "POST", body: withRequestId({ workId, role, ttl, ...input }) }),
     heartbeat: (leaseId, input = {}) =>
@@ -71,7 +79,12 @@ export function createPullboardClient({ baseUrl, token, fetchImpl = fetch, reque
     release: (leaseId, input = {}) =>
       call("/api/lease", { method: "POST", body: withRequestId({ action: "release", leaseId, ...input }) }),
     submit: (input) => call("/api/submit", { method: "POST", body: withRequestId(input) }),
+    supersede: (workId, submissionId, input = {}) =>
+      call("/api/supersede", { method: "POST", body: withRequestId({ workId, submissionId, ...input }) }),
     verify: (input) => call("/api/verify", { method: "POST", body: withRequestId(input) }),
+    // Token issuance uses STRICT_INPUT and is not requestId-idempotent — send ONLY the documented
+    // fields (an optional label); adding a requestId is rejected as an extra field.
+    issueToken: (input = {}) => call("/api/accounts/tokens", { method: "POST", body: input }),
     patchItem: async (workId, changes, input = {}) => {
 
       // Read the current item version before constructing an optimistic patch.

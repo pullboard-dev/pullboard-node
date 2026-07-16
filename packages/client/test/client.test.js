@@ -33,12 +33,75 @@ describe("client", () => {
         assert.deepEqual(JSON.parse(calls[1].init.body), { title: "Clearer", expectedUpdatedAt: "version-7", requestId: "patch-id" });
     });
 
+    test("getStatus GETs /api/status with the query verbatim and returns the payload unwrapped", async () => {
+        const calls = [];
+        const client = createPullboardClient({
+            baseUrl: "http://pullboard.test", token: "secret",
+            fetchImpl: async (url, init) => { calls.push({ url, init }); return response({ counts: { active: 5, total: 10 } }); },
+        });
+        const status = await client.getStatus("?limit=1");
+        assert.equal(calls[0].url, "http://pullboard.test/api/status?limit=1");
+        assert.equal(calls[0].init.method, "GET");
+        assert.equal(calls[0].init.headers.authorization, "Bearer secret");
+        // Status is a top-level payload — unlike getItem it is NOT unwrapped from an envelope.
+        assert.deepEqual(status, { counts: { active: 5, total: 10 } });
+        // Default (no query) hits the bare path.
+        await client.getStatus();
+        assert.equal(calls[1].url, "http://pullboard.test/api/status");
+    });
+
+    test("supersede POSTs workId + submissionId with a generated requestId", async () => {
+        const calls = [];
+        const client = createPullboardClient({
+            baseUrl: "http://pullboard.test", token: "secret", requestId: () => "sup-id",
+            fetchImpl: async (url, init) => { calls.push({ url, init }); return response({ workId: "w", state: "in-progress" }); },
+        });
+        await client.supersede("work/one", "submission-9");
+        assert.equal(calls[0].url, "http://pullboard.test/api/supersede");
+        assert.equal(calls[0].init.method, "POST");
+        assert.deepEqual(JSON.parse(calls[0].init.body), { workId: "work/one", submissionId: "submission-9", requestId: "sup-id" });
+    });
+
     test("surfaces stable API error metadata", async () => {
         const client = createPullboardClient({
             baseUrl: "http://pullboard.test", token: "secret",
             fetchImpl: async () => response({ error: "WORK_TAKEN", message: "held" }, 409),
         });
         await assert.rejects(client.claim("work"), (error) => error.code === "WORK_TAKEN" && error.status === 409);
+    });
+
+    test("preserves the server's fix and docs guidance on errors", async () => {
+        const client = createPullboardClient({
+            baseUrl: "http://pullboard.test", token: "secret",
+            fetchImpl: async () => response({ error: "INVALID_INPUT", message: "bad", fix: "do X", docs: "/errors/INVALID_INPUT" }, 400),
+        });
+        await assert.rejects(client.claim("work"), (error) => error.fix === "do X" && error.docs === "/errors/INVALID_INPUT");
+    });
+
+    test("issueToken mints a sibling workspace token via /api/accounts/tokens", async () => {
+        const calls = [];
+        const client = createPullboardClient({
+            baseUrl: "http://pullboard.test", token: "secret", requestId: () => "tok-id",
+            fetchImpl: async (url, init) => { calls.push({ url, init }); return response({ token: "new-token", serviceToken: { principalId: "agent:2" } }); },
+        });
+        const minted = await client.issueToken({ label: "verifier" });
+        assert.equal(calls[0].url, "http://pullboard.test/api/accounts/tokens");
+        assert.equal(calls[0].init.method, "POST");
+        assert.deepEqual(JSON.parse(calls[0].init.body), { label: "verifier" }, "STRICT_INPUT: no requestId extra");
+        assert.equal(minted.token, "new-token");
+    });
+
+    test("createItem posts to /api/items with a request id and unwraps the item", async () => {
+        const calls = [];
+        const client = createPullboardClient({
+            baseUrl: "http://pullboard.test", token: "secret", requestId: () => "create-id",
+            fetchImpl: async (url, init) => { calls.push({ url, init }); return response({ item: { workId: "new-1" } }); },
+        });
+        const item = await client.createItem({ title: "A task", criteria: ["one"] });
+        assert.equal(calls[0].url, "http://pullboard.test/api/items");
+        assert.equal(calls[0].init.method, "POST");
+        assert.deepEqual(JSON.parse(calls[0].init.body), { title: "A task", criteria: ["one"], requestId: "create-id" });
+        assert.deepEqual(item, { workId: "new-1" }, "returns the unwrapped item");
     });
 
     test("claim, submit, and verify happy path needs no request-id retry", async () => {
