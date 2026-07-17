@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -10,6 +10,24 @@ import { createPullboardClient, anonProvision, resolveToken } from "@pullboard/c
 // (The old all-zeros placeholder is a valid 40-hex for the API but breaks `git diff`.)
 const EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 const CONFIG_PATH = join(homedir(), ".pullboard", "config.json");
+
+// A git object name is 7-40 lowercase hex chars and NOTHING else. baseSHA/headSHA can arrive
+// from a SERVER-controlled item field (item.baseSHA), so before either value is ever handed to
+// git it must be proven to be exactly that — no `;`, `$( )`, `..`, spaces, or any other shell or
+// ref-spec metacharacter can survive this. The empty-tree constant is the one allowed non-commit
+// value (used when there is no prior commit to diff against).
+const GIT_SHA = /^[0-9a-f]{7,40}$/;
+/**
+ * Assert a value is a safe git object name before it reaches git, or throw.
+ *
+ * @param {string} value - The candidate SHA (may be server-controlled).
+ * @param {string} label - Which SHA this is, for the error message.
+ * @returns {string} The validated value.
+ */
+const assertSHA = (value, label) => {
+  if (value === EMPTY_TREE_SHA || (typeof value === "string" && GIT_SHA.test(value))) return value;
+  throw new Error(`refusing an unsafe ${label} ${JSON.stringify(value)} — a git SHA must be 7-40 hex chars (server/board-controlled input is never trusted into a git command)`);
+};
 const readConfig = () => { try { return JSON.parse(readFileSync(CONFIG_PATH, "utf8")); } catch { return {}; } };
 const writeConfig = (config) => { mkdirSync(dirname(CONFIG_PATH), { recursive: true }); writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 }); };
 
@@ -107,7 +125,16 @@ export async function run(argv, deps = {}) {
 
   const {
     env = process.env,
+
+    // `exec` runs the operator's own `-- <cmd>` build command in a shell (that string is
+    // user-supplied argv typed at their own terminal — never server/board data — so shell
+    // features like `&&` are intended). Git, in contrast, NEVER goes through a shell: `execFile`
+    // spawns the binary directly with an argv array, so no interpolated value is ever parsed by a
+    // shell. That, plus assertSHA, is the belt-and-suspenders fix for the baseSHA injection. Its
+    // stderr is discarded so the expected "fatal: ambiguous argument 'HEAD~1'" probe on a
+    // single-commit repo never reads like a failure to a weaker agent.
     exec = (cmd) => execSync(cmd, { encoding: "utf8" }),
+    execFile = (file, args) => execFileSync(file, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }),
     log = console.log,
     error = console.error,
     makeClient = createPullboardClient,
@@ -168,10 +195,19 @@ export async function run(argv, deps = {}) {
       throw caught;
     }
   }
-  const client = deps.client || makeClient({ baseUrl, token });
+  // Constructing the client validates the destination (assertSafeBaseUrl) — a bad --url/PULLBOARD_URL
+  // that would leak the token to an insecure host fails closed here with a clean message, not a stack.
+  let client;
+  try {
+    client = deps.client || makeClient({ baseUrl, token });
+  } catch (caught) {
+    error(`pullboard: ${caught.message}`);
+    return 1;
+  }
   const workId = positionals[0];
   const need = (value, name) => { if (!value) throw new Error(`pullboard ${command}: ${name} is required`); return value; };
-  const git = (args) => exec(`git ${args}`).trim();
+  // Run git with no shell — args is an argv ARRAY, so nothing is interpolated into a command line.
+  const git = (args) => execFile("git", args).trim();
   const tryGit = (args) => { try { return git(args); } catch { return null; } };
 
   try {
@@ -281,15 +317,17 @@ export async function run(argv, deps = {}) {
         // git evidence. IMPORTANT: it submits the commit you ALREADY made — `-- <cmd>` is an
         // optional post-commit check, NOT where you do the work.
         need(workId, "workId");
-        if (!tryGit("rev-parse --git-dir")) {
+        if (!tryGit(["rev-parse", "--git-dir"])) {
           error("pullboard build must run inside a git repo — it submits your commit as the evidence. cd into your project first.");
           return 1;
         }
-        const headSHA = tryGit("rev-parse HEAD");
-        if (!headSHA) {
+        const headRaw = tryGit(["rev-parse", "HEAD"]);
+        if (!headRaw) {
           error("pullboard build: this repo has no commits yet. Commit your work first — build submits your latest commit as evidence, it does not create it.");
           return 1;
         }
+        // Validate even the locally-derived HEAD (defense in depth) before it touches a git command.
+        const headSHA = assertSHA(headRaw, "headSHA");
         const item = await client.getItem(workId);
         const claimed = await client.claim(workId, { role: "builder", ttl: Number(flags.ttl) || 3600 });
 
@@ -308,12 +346,16 @@ export async function run(argv, deps = {}) {
           }
         }
 
-        // Suppress git's stderr on this probe: on a single-commit repo HEAD~1 doesn't exist, and a
-        // stray "fatal: ambiguous argument 'HEAD~1'" printed just before a SUCCESSFUL submit reads
-        // like a failure to a weaker agent. Falling back to the empty tree is the correct path.
-        const baseSHA = flags.base || item.baseSHA || tryGit("rev-parse HEAD~1 2>/dev/null") || EMPTY_TREE_SHA;
-        // Real evidence: a digest of the actual diff (falls back to the build command when there is no diff).
-        const diff = exec(`git diff ${baseSHA}..${headSHA}`) || (passthrough || []).join(" ");
+        // Validate BOTH SHAs before either touches git. baseSHA in particular can come from
+        // item.baseSHA (SERVER/board-controlled), so a malicious value like "; touch /tmp/pwned"
+        // is rejected here and never reaches a command. On a single-commit repo HEAD~1 doesn't
+        // exist; tryGit returns null (its stderr is discarded by execFile) and we fall back to the
+        // empty tree — the correct path.
+        const baseSHA = assertSHA(flags.base || item.baseSHA || tryGit(["rev-parse", "HEAD~1"]) || EMPTY_TREE_SHA, "baseSHA");
+        // Real evidence: a digest of the actual diff (falls back to the build command when there is
+        // no diff). No shell: the "<base>..<head>" range is one argv element to execFile, and both
+        // ends were validated above — so injection is closed by construction AND by validation.
+        const diff = execFile("git", ["diff", `${baseSHA}..${headSHA}`]) || (passthrough || []).join(" ");
         const evidenceDigest = sha256(diff);
         const receipt = await client.submit({
           leaseId: claimed.leaseId,

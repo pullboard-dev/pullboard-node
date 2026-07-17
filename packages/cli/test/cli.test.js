@@ -24,16 +24,6 @@ function stubClient(overrides = {}) {
   };
 }
 
-// A git exec stub: answers the build preflight (git-dir + HEAD) and lets each test override diffs.
-function gitExec(extra = () => undefined) {
-  return (cmd) => {
-    if (cmd === "git rev-parse --git-dir") return ".git\n";
-    const override = extra(cmd);
-    if (override !== undefined) return override;
-    return "";
-  };
-}
-
 test("parseArgs splits positionals, flags, and a -- passthrough tail", () => {
   const parsed = parseArgs(["build", "item-1", "--tier", "self-reported", "--base", "abc", "--", "npm", "run", "build"]);
   assert.equal(parsed.command, "build");
@@ -47,23 +37,27 @@ test("parseArgs splits positionals, flags, and a -- passthrough tail", () => {
 test("build claims, runs the command, and submits REAL evidence — a digest of the actual diff", async () => {
   const client = stubClient();
   const execCalls = [];
+  const gitCalls = [];
   const DIFF = "diff --git a/x b/x\n+real work";
-  const exec = (cmd) => {
-    execCalls.push(cmd);
-    if (cmd === "git rev-parse --git-dir") return ".git\n";
-    if (cmd === "git rev-parse HEAD") return "f".repeat(40) + "\n";
-    if (cmd.startsWith("git rev-parse HEAD~1")) return "e".repeat(40) + "\n";
-    if (cmd.startsWith("git diff")) return DIFF;
+  // The operator's `-- <cmd>` runs through the shell exec; git NEVER does — it goes through
+  // execFile with an argv ARRAY, so nothing is interpolated into a command line.
+  const exec = (cmd) => { execCalls.push(cmd); return ""; };
+  const execFile = (file, args) => {
+    gitCalls.push([file, ...args]);
+    if (file === "git" && args[0] === "rev-parse" && args[1] === "--git-dir") return ".git\n";
+    if (file === "git" && args[0] === "rev-parse" && args[1] === "HEAD") return "f".repeat(40) + "\n";
+    if (file === "git" && args[0] === "rev-parse" && args[1] === "HEAD~1") return "e".repeat(40) + "\n";
+    if (file === "git" && args[0] === "diff") return DIFF;
     return "";
   };
   const out = [];
-  const code = await run(["build", "item-9", "--", "npm", "test"], { client, exec, env: { PULLBOARD_TOKEN: "t" }, log: (m) => out.push(m) });
+  const code = await run(["build", "item-9", "--", "npm", "test"], { client, exec, execFile, env: { PULLBOARD_TOKEN: "t" }, log: (m) => out.push(m) });
 
   assert.equal(code, 0);
-  // It ran the passthrough build command.
-  assert.ok(execCalls.includes("npm test"), "the -- command is executed");
-  // It computed the diff between the resolved base and head.
-  assert.ok(execCalls.some((c) => c === `git diff ${"e".repeat(40)}..${"f".repeat(40)}`), "diffs base..head");
+  // It ran the passthrough build command (in the shell path).
+  assert.ok(execCalls.includes("npm test"), "the -- command is executed via the shell exec");
+  // It computed the diff between the resolved base and head — as ONE argv element, no shell.
+  assert.deepEqual(gitCalls.find((c) => c[1] === "diff"), ["git", "diff", `${"e".repeat(40)}..${"f".repeat(40)}`], "diffs base..head via execFile argv");
   const submit = client.calls.find(([name]) => name === "submit")[1];
   assert.equal(submit.leaseId, "lease-1");
   assert.equal(submit.headSHA, "f".repeat(40), "real head SHA from git");
@@ -76,19 +70,83 @@ test("build claims, runs the command, and submits REAL evidence — a digest of 
 
 test("build honors --base/--tier and falls back to the empty tree when there is no prior commit", async () => {
   const client = stubClient({ submit: { state: "closed", assurance: "DEMO_UNTRUSTED" } });
-  const exec = (cmd) => {
-    if (cmd === "git rev-parse --git-dir") return ".git";
-    if (cmd === "git rev-parse HEAD") return "a".repeat(40);
-    if (cmd.startsWith("git rev-parse HEAD~1")) throw new Error("no prior commit");
-    if (cmd.startsWith("git diff")) return ""; // no diff -> evidence falls back to the command text
+  const exec = (cmd) => cmd === "make" ? "" : ""; // the passthrough build command runs in the shell path
+  const execFile = (file, args) => {
+    if (args[0] === "rev-parse" && args[1] === "--git-dir") return ".git";
+    if (args[0] === "rev-parse" && args[1] === "HEAD") return "a".repeat(40);
+    if (args[0] === "rev-parse" && args[1] === "HEAD~1") throw new Error("no prior commit");
+    if (args[0] === "diff") return ""; // no diff -> evidence falls back to the command text
     return "";
   };
   const out = [];
-  await run(["build", "item-1", "--tier", "self-reported", "--", "make"], { client, exec, env: { PULLBOARD_TOKEN: "t" }, log: (m) => out.push(m) });
+  await run(["build", "item-1", "--tier", "self-reported", "--", "make"], { client, exec, execFile, env: { PULLBOARD_TOKEN: "t" }, log: (m) => out.push(m) });
   const submit = client.calls.find(([name]) => name === "submit")[1];
   assert.equal(submit.completionTier, "self-reported");
   assert.equal(submit.baseSHA, "4b825dc642cb6eb9a060e54bf8d69288fbee4904", "git's real empty-tree base when HEAD~1 is unavailable");
   assert.equal(submit.evidenceDigest, sha256("make"), "no diff -> evidence digests the build command");
+});
+
+test("build REFUSES a malicious server-controlled item.baseSHA and never reaches a git command (finding #5 — RCE)", async () => {
+  // item.baseSHA is board/SERVER-controlled: a hostile board could set it to a shell payload,
+  // which — before this fix — was interpolated straight into `git diff ${baseSHA}..${headSHA}`.
+  for (const evil of ["; touch /tmp/pwned", "$(id)", "a..b; rm x", "HEAD; rm -rf ~", "`whoami`", "..", "deadbeef;ls"]) {
+    const client = stubClient({ item: { baseSHA: evil } });
+    const gitCalls = [];
+    const execCalls = [];
+    // execFile answers the preflight (git-dir + HEAD) so validation is reached at baseSHA resolution.
+    const execFile = (file, args) => {
+      gitCalls.push([file, ...args]);
+      if (args[0] === "rev-parse" && args[1] === "--git-dir") return ".git";
+      if (args[0] === "rev-parse" && args[1] === "HEAD") return "f".repeat(40);
+      return "";
+    };
+    const exec = (cmd) => { execCalls.push(cmd); return ""; };
+    const errs = [];
+    const code = await run(["build", "item-x"], { client, exec, execFile, env: { PULLBOARD_TOKEN: "t" }, error: (m) => errs.push(m) });
+    assert.equal(code, 1, `rejects baseSHA ${JSON.stringify(evil)}`);
+    assert.match(errs[0], /unsafe baseSHA/, "fails closed with a clear rejection");
+    assert.match(errs[0], /7-40 hex/, "explains the required shape");
+    // The poisoned value NEVER reached a git diff (validation fired first) nor any shell command.
+    assert.ok(!gitCalls.some((c) => c[1] === "diff"), "no git diff was ever attempted with the payload");
+    assert.ok(!execCalls.some((c) => c.includes(evil)), "the payload never reached the shell exec");
+  }
+});
+
+test("build validates the --base flag too, not only the server field (finding #5)", async () => {
+  const client = stubClient();
+  const execFile = (file, args) => {
+    if (args[0] === "rev-parse" && args[1] === "--git-dir") return ".git";
+    if (args[0] === "rev-parse" && args[1] === "HEAD") return "f".repeat(40);
+    return "";
+  };
+  const errs = [];
+  const code = await run(["build", "item-x", "--base", "$(rm -rf /)"], { client, execFile, env: { PULLBOARD_TOKEN: "t" }, error: (m) => errs.push(m) });
+  assert.equal(code, 1);
+  assert.match(errs[0], /unsafe baseSHA/);
+});
+
+test("build accepts a valid server-provided item.baseSHA and diffs it as a single argv element (finding #5)", async () => {
+  const validBase = "a1b2c3d4e5f6"; // 12 hex chars — within the 7-40 window
+  const client = stubClient({ item: { baseSHA: validBase } });
+  const gitCalls = [];
+  const execFile = (file, args) => {
+    gitCalls.push([file, ...args]);
+    if (args[0] === "rev-parse" && args[1] === "--git-dir") return ".git";
+    if (args[0] === "rev-parse" && args[1] === "HEAD") return "f".repeat(40);
+    if (args[0] === "diff") return "D";
+    return "";
+  };
+  const code = await run(["build", "item-x"], { client, execFile, env: { PULLBOARD_TOKEN: "t" }, log: () => {} });
+  assert.equal(code, 0);
+  assert.deepEqual(gitCalls.find((c) => c[1] === "diff"), ["git", "diff", `${validBase}..${"f".repeat(40)}`], "the range is one argv element, never a shell string");
+});
+
+test("a --url that would leak the token to an insecure host fails closed with a clean error (finding #4 at the CLI)", async () => {
+  // No client injected -> the real @pullboard/client is constructed, which validates the destination.
+  const errs = [];
+  const code = await run(["status", "--url", "http://evil.example"], { env: { PULLBOARD_TOKEN: "t" }, loadConfig: () => ({}), error: (m) => errs.push(m) });
+  assert.equal(code, 1);
+  assert.match(errs[0], /refuses to send your bearer token/, "clean pullboard: error, not an uncaught stack");
 });
 
 test("auth and command guards fail closed", async () => {
@@ -292,15 +350,18 @@ test("init refuses to clobber an existing board unless --force", async () => {
 
 test("build releases the lease and submits nothing when the check command fails", async () => {
   const client = stubClient();
-  const exec = (cmd) => {
-    if (cmd === "git rev-parse --git-dir") return ".git";
-    if (cmd === "git rev-parse HEAD") return "a".repeat(40);
-    if (cmd.startsWith("git ")) return "";
+  // git goes through execFile (argv, no shell); the failing -- check command goes through the shell exec.
+  const execFile = (file, args) => {
+    if (args[0] === "rev-parse" && args[1] === "--git-dir") return ".git";
+    if (args[0] === "rev-parse" && args[1] === "HEAD") return "a".repeat(40);
+    return "";
+  };
+  const exec = () => {
     // the -- check command fails, carrying real stderr like execSync does.
     throw Object.assign(new Error("Command failed"), { stderr: "npm ERR! test failed\n" });
   };
   const errs = [];
-  const code = await run(["build", "item-x", "--", "npm", "test"], { client, exec, env: { PULLBOARD_TOKEN: "t" }, error: (m) => errs.push(m) });
+  const code = await run(["build", "item-x", "--", "npm", "test"], { client, exec, execFile, env: { PULLBOARD_TOKEN: "t" }, error: (m) => errs.push(m) });
   assert.equal(code, 1);
   assert.ok(client.calls.some(([n]) => n === "release"), "the lease is released so the item does not dangle in-progress");
   assert.ok(!client.calls.some(([n]) => n === "submit"), "nothing is submitted when the check fails");
@@ -309,9 +370,9 @@ test("build releases the lease and submits nothing when the check command fails"
 
 test("build fails clearly outside a git repo instead of a cryptic git error", async () => {
   const client = stubClient();
-  const exec = (cmd) => { if (cmd === "git rev-parse --git-dir") throw new Error("not a git repository"); return ""; };
+  const execFile = (file, args) => { if (args[0] === "rev-parse" && args[1] === "--git-dir") throw new Error("not a git repository"); return ""; };
   const errs = [];
-  const code = await run(["build", "item-x", "--", "true"], { client, exec, env: { PULLBOARD_TOKEN: "t" }, error: (m) => errs.push(m) });
+  const code = await run(["build", "item-x", "--", "true"], { client, execFile, env: { PULLBOARD_TOKEN: "t" }, error: (m) => errs.push(m) });
   assert.equal(code, 1);
   assert.ok(errs[0].includes("must run inside a git repo"));
   assert.ok(!client.calls.some(([n]) => n === "claim"), "does not claim before the git preflight passes");

@@ -2,6 +2,36 @@ import { randomUUID } from "node:crypto";
 
 export { resolveToken } from "./token.js";
 
+// Hosts for which plaintext http:// is tolerated — a developer running the API on their own
+// machine. Anything else MUST be https://, because every request carries the bearer token in an
+// Authorization header and http:// to a remote host puts that token on the wire in cleartext (and
+// invites a downgrade/redirect to an attacker-chosen destination).
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+
+/**
+ * Reject a baseUrl that would leak the bearer token to an insecure or unexpected destination.
+ * https:// is always allowed; http:// is allowed ONLY for a loopback host (local dev). Every other
+ * scheme (http:// to a remote host, and non-http(s) schemes like file://, ftp://, ws://) throws.
+ *
+ * @param {string} baseUrl - The configured base URL the token would be sent to.
+ * @returns {string} The same baseUrl when it is safe.
+ */
+export function assertSafeBaseUrl(baseUrl) {
+
+  let url;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    throw new TypeError(`Pullboard baseUrl must be an absolute URL, received: ${JSON.stringify(baseUrl)}`);
+  }
+  const loopback = LOOPBACK_HOSTS.has(url.hostname);
+  if (url.protocol === "https:" || (url.protocol === "http:" && loopback)) return baseUrl;
+  throw new TypeError(
+    `Pullboard refuses to send your bearer token to ${url.protocol}//${url.host} — use https:// ` +
+    "(plain http:// is allowed only for localhost/127.0.0.1 during development).",
+  );
+}
+
 /**
  * Create a token-authenticated client for Pullboard's coordination API.
  *
@@ -12,6 +42,10 @@ export function createPullboardClient({ baseUrl, token, fetchImpl = fetch, reque
 
   // Requests cannot be scoped or authenticated without both required values.
   if (!baseUrl || !token) throw new TypeError("baseUrl and token are required");
+
+  // The shared choke point: every authenticated operation flows through here, so validating the
+  // destination once guarantees the token is never sent to an http:// remote or a non-web scheme.
+  assertSafeBaseUrl(baseUrl);
 
   // Normalize one trailing slash so every operation can append an absolute API path.
   const origin = baseUrl.replace(/\/$/, "");
@@ -124,6 +158,9 @@ export function createPullboardClient({ baseUrl, token, fetchImpl = fetch, reque
  */
 export async function anonProvision({ baseUrl = "https://pullboard.dev", label = "pullboard-cli", fetchImpl = fetch } = {}) {
 
+  // Onboarding sends no bearer token, but it RECEIVES one — guard the destination before we ask a
+  // server to mint a token we would then store, so a misconfigured http:// URL cannot phish it.
+  assertSafeBaseUrl(baseUrl);
   const response = await fetchImpl(`${baseUrl.replace(/\/$/, "")}/api/accounts/anon-provision`, {
     method: "POST",
     headers: { "content-type": "application/json" },
