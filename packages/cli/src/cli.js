@@ -35,6 +35,8 @@ export const HELP = `pullboard — drive agent work on a Pullboard board from th
 
   pullboard onboard                      print the full agent loop (how this board works) — START HERE
   pullboard init [--force]               provision a workspace + token (no signup); saves it locally
+  pullboard login <token> [--url ..]     save an existing token locally (e.g. after yours expired)
+  pullboard whoami                       print who/where you are: board url, token, principal, project
   pullboard doctor                       confirm you are actually connected to the board
   pullboard status [--limit N]           list the board: counts + top actionable items
   pullboard create "<title>" [--description ..] [--criteria "a|b|c"] [--priority ..]   add a work item
@@ -93,12 +95,70 @@ Rules the board enforces: claims are exclusive (WORK_TAKEN if another agent hold
 verify your own submission; every completion binds your commit + the item's criteria. Run any command
 with missing arguments to see exactly what it needs.
 
+If a command says your token is rejected or expired (the anonymous token lasts ~24h), get a fresh one
+with 'pullboard init' — or 'pullboard login <token>' if you already have one — then retry. Run
+'pullboard whoami' to see which board/identity you are on, or 'pullboard doctor' to test the connection.
+
 A submission without repo-bound proof shows assurance=DEMO_UNTRUSTED — that is demo mode and expected
 until attestation is configured; it does NOT mean your submission failed.
 
 Full manual: https://pullboard.dev/docs/llms.txt   ·   API contract: https://pullboard.dev/docs/openapi.json`;
 
 const sha256 = (text) => `sha256:${createHash("sha256").update(text).digest("hex")}`;
+
+// Node <18 has no global fetch, so every network command dies with a cryptic "fetch is not defined".
+// Detect it up front and tell a weaker agent exactly what to do instead. Offline commands
+// (help/onboard) are allowed through so the guide still reads on any Node.
+const NODE_MAJOR = (version) => Number(String(version || "0").split(".")[0]);
+
+// The signatures of a transport-level failure (DNS, refused, timeout, no global fetch) — as opposed
+// to a server error envelope, which arrives with an HTTP .status. undici throws a TypeError whose
+// .cause carries the real code; a Node-<18 network call throws a ReferenceError for `fetch`.
+const NETWORK_ERROR = /fetch failed|fetch is not defined|ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EAI_AGAIN|getaddrinfo|socket hang up|network|Failed to fetch|und_err/i;
+
+/**
+ * Turn any thrown failure into plain, actionable guidance for a weak agent — never a raw status code
+ * or a bare stack. Distinguishes the four failure modes that actually strand an agent: the board is
+ * unreachable (network/offline), the token is rejected (expired 24h / invalid), rate-limiting, and a
+ * server error envelope (whose own message + fix + docs are surfaced verbatim).
+ *
+ * @param {any} caught The thrown error (may carry .status/.fix/.docs from the client).
+ * @param {string} baseUrl The board the request was aimed at, for the network message.
+ * @returns {{kind: string, lines: string[]}} A category and the lines to print (extras are indented).
+ */
+export function explainFailure(caught, baseUrl) {
+
+  const status = caught && caught.status;
+  const message = (caught && caught.message) || String(caught);
+  const causeCode = caught && caught.cause && (caught.cause.code || caught.cause.message);
+  const networkLike = !status && (caught?.name === "TypeError" || caught?.name === "ReferenceError" || Boolean(caught?.cause) || NETWORK_ERROR.test(message));
+
+  if (networkLike) {
+    return { kind: "network", lines: [
+      `can't reach the board at ${baseUrl} — check your network, or PULLBOARD_URL/--url if the board moved.`,
+      `  (${message}${causeCode && causeCode !== message ? `: ${causeCode}` : ""})`,
+    ] };
+  }
+  if (status === 401 || status === 403) {
+    return { kind: "auth", lines: [
+      `the board rejected your token (${status}) — it is invalid, revoked, or the anonymous ~24h token has expired.`,
+      `  -> get a fresh token with 'pullboard init', or 'pullboard login <token>' if you have one (or pass PULLBOARD_TOKEN / --token), then re-run.`,
+      ...(caught.fix ? [`  server: ${caught.fix}`] : []),
+      ...(caught.docs ? [`  docs: ${caught.docs}`] : []),
+    ] };
+  }
+  if (status === 429) {
+    return { kind: "rate-limit", lines: [
+      `rate-limited (429) — the board is asking you to slow down. Wait a few seconds and retry${caught.retryAfter ? ` (retry-after ${caught.retryAfter}s)` : ""}.`,
+      ...(caught.docs ? [`  docs: ${caught.docs}`] : []),
+    ] };
+  }
+  return { kind: "error", lines: [
+    message,
+    ...(caught && caught.fix ? [`  -> ${caught.fix}`] : []),
+    ...(caught && caught.docs ? [`  docs: ${caught.docs}`] : []),
+  ] };
+}
 
 // A tiny flag parser: positionals, --key value / --key (boolean), and a "--" passthrough tail.
 export function parseArgs(argv) {
@@ -138,6 +198,7 @@ export async function run(argv, deps = {}) {
     log = console.log,
     error = console.error,
     makeClient = createPullboardClient,
+    nodeVersion = process.versions.node,
   } = deps;
   const { command, positionals, flags, passthrough } = parseArgs(argv);
 
@@ -151,6 +212,15 @@ export async function run(argv, deps = {}) {
   // and go AFTER it. Say so plainly instead of the generic "unknown command" this would otherwise hit.
   if (command.startsWith("-")) {
     error(`pullboard: '${command}' looks like a flag, not a command. Flags go AFTER the subcommand — e.g. 'pullboard claim <workId> --token <t>'.`);
+    return 1;
+  }
+
+  // Every command past this point talks to the board, and Node <18 has no global fetch — the call
+  // would die with a cryptic "fetch is not defined". Fail with a plain upgrade instruction instead.
+  // (help/onboard returned above, so the offline guide still reads on any Node.)
+  if (NODE_MAJOR(nodeVersion) < 18) {
+    error(`pullboard: Node ${nodeVersion} is too old — this tool needs Node 18 or newer (it uses the built-in fetch).`);
+    error("  -> upgrade Node (https://nodejs.org), then re-run. 'pullboard onboard' works on any version if you just need the guide.");
     return 1;
   }
 
@@ -175,7 +245,41 @@ export async function run(argv, deps = {}) {
       log("Next: 'pullboard status' to see the board · 'pullboard create \"a task\"' to add work · 'pullboard onboard' for the full loop.");
       return 0;
     } catch (caught) {
-      error(`pullboard init: ${caught.message}`);
+      const { lines } = explainFailure(caught, baseUrl);
+      error(`pullboard init: ${lines[0]}`);
+      for (const extra of lines.slice(1)) error(extra);
+      return 1;
+    }
+  }
+
+  if (command === "login") {
+    // Save an existing token locally — the "or login" recovery path when your ~24h token expires and
+    // you already have a fresh one (from a teammate, a second `init`, or your workspace). Validates it
+    // against the board before persisting, so a bad paste fails HERE, not on your next real command.
+    const provided = flags.token || positionals[0];
+    if (!provided) {
+      error('pullboard login: paste a token — pullboard login <token> [--url <board>]');
+      error("  (get one with 'pullboard init', or from your workspace. Anonymous tokens last ~24h.)");
+      return 1;
+    }
+    let probe;
+    try {
+      probe = deps.client || makeClient({ baseUrl, token: provided });
+    } catch (caught) {
+      error(`pullboard login: ${caught.message}`);
+      return 1;
+    }
+    try {
+      const status = await probe.getStatus("?limit=1");
+      saveConfig({ baseUrl, token: provided });
+      const principal = status.firstContact?.principalId;
+      log(`logged in — token saved to ~/.pullboard/config.json${principal ? ` (${principal})` : ""}.`);
+      log("Next: 'pullboard whoami' to confirm · 'pullboard status' to see the board.");
+      return 0;
+    } catch (caught) {
+      const { lines } = explainFailure(caught, baseUrl);
+      error(`pullboard login: that token was not accepted — nothing was saved. ${lines[0]}`);
+      for (const extra of lines.slice(1)) error(extra);
       return 1;
     }
   }
@@ -371,6 +475,33 @@ export async function run(argv, deps = {}) {
         if (receipt.assurance === "DEMO_UNTRUSTED") log("note: DEMO_UNTRUSTED — head/checks are not provider-verified; configure repo-bound proof (attestation) for PROVIDER_ENFORCED.");
         return 0;
       }
+      case "whoami": {
+        // Who / where am I on the board — config + connectivity + token state in one glance. Prints
+        // the local config first (always available, even offline), then probes the board for the
+        // identity + connectivity. A masked token preview lets an agent confirm WHICH token is in use
+        // without ever printing the secret.
+        const masked = token ? `${token.slice(0, 4)}…${token.slice(-4)} (${token.length} chars)` : "(none)";
+        log("pullboard whoami:");
+        log(`  board url:     ${baseUrl}`);
+        log(`  token source:  ${tokenSource}`);
+        log(`  token:         ${masked}`);
+        try {
+          const status = await client.getStatus("?limit=1");
+          const counts = status.counts || status.triage || {};
+          const principal = status.firstContact?.principalId || "(unknown — board returned no principal)";
+          const project = status.project?.name ? `${status.project.name}${status.project.projectId ? ` (${status.project.projectId})` : ""}` : "(unknown)";
+          log(`  principal:     ${principal}`);
+          log(`  project:       ${project}`);
+          log(`  connectivity:  OK — board reachable, token accepted (${counts.active ?? "?"} active, ${counts.total ?? "?"} total items).`);
+          return 0;
+        } catch (probe) {
+          const { kind, lines } = explainFailure(probe, baseUrl);
+          log(`  connectivity:  FAILED (${kind}) — you are NOT driving the board.`);
+          error(`pullboard whoami: ${lines[0]}`);
+          for (const extra of lines.slice(1)) error(extra);
+          return 1;
+        }
+      }
       case "doctor": {
         // The preflight: prove the resolved token actually reaches the board before an agent
         // starts working. Success or a loud "you are NOT driving the board" — never ambiguity.
@@ -380,7 +511,12 @@ export async function run(argv, deps = {}) {
           log(`pullboard doctor: OK — token via ${tokenSource}; connected to the board (${counts.active ?? "?"} active, ${counts.total ?? "?"} total items).`);
           return 0;
         } catch (probe) {
-          error(`pullboard doctor: a token was resolved via ${tokenSource}, but the board rejected it (${probe.status || probe.message}). It is likely revoked or expired — you are NOT driving the board. Fix the token before working.`);
+          // Distinguish "board unreachable" from "token rejected" — telling an agent to fix its token
+          // when the real problem is the network (or vice-versa) sends it down the wrong rabbit hole.
+          const { kind, lines } = explainFailure(probe, baseUrl);
+          const cause = kind === "network" ? "the board is unreachable" : kind === "auth" ? "the board rejected your token" : "the request failed";
+          error(`pullboard doctor: a token was resolved via ${tokenSource}, but ${cause} — you are NOT driving the board.`);
+          for (const line of lines) error(`  ${line.trim()}`);
           return 1;
         }
       }
@@ -389,10 +525,12 @@ export async function run(argv, deps = {}) {
         return 1;
     }
   } catch (caught) {
-    // Surface the server's own guidance (message + fix + docs) instead of a bare status code.
-    error(`pullboard: ${caught.message}`);
-    if (caught.fix) error(`  -> ${caught.fix}`);
-    if (caught.docs) error(`  docs: ${caught.docs}`);
+    // Classify into plain, actionable guidance: network/offline, expired-or-invalid token (with the
+    // re-init/login next step), rate-limit, or a server envelope whose message + fix + docs are
+    // surfaced verbatim — never a bare status code or a raw stack.
+    const { lines } = explainFailure(caught, baseUrl);
+    error(`pullboard: ${lines[0]}`);
+    for (const extra of lines.slice(1)) error(extra);
     return 1;
   }
 }

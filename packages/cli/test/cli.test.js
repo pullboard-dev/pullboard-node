@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { parseArgs, run, HELP } from "../src/cli.js";
+import { parseArgs, run, HELP, explainFailure } from "../src/cli.js";
 
 const sha256 = (text) => `sha256:${createHash("sha256").update(text).digest("hex")}`;
 
@@ -408,4 +408,126 @@ test("errors surface the server's own fix and docs guidance", async () => {
   assert.ok(joined.includes("multiple invalid fields"), "shows the message");
   assert.ok(joined.includes("copy its criterionDigest"), "shows the server's fix");
   assert.ok(joined.includes("/errors/"), "shows the docs link");
+});
+
+test("explainFailure classifies the four real failure modes and never misreads a plain error", () => {
+  assert.equal(explainFailure(Object.assign(new Error("x"), { status: 401 }), "https://b").kind, "auth");
+  assert.equal(explainFailure(Object.assign(new Error("x"), { status: 403 }), "https://b").kind, "auth");
+  assert.equal(explainFailure(Object.assign(new Error("x"), { status: 429 }), "https://b").kind, "rate-limit");
+  assert.equal(explainFailure(new TypeError("fetch failed"), "https://b").kind, "network");
+  assert.equal(explainFailure(new ReferenceError("fetch is not defined"), "https://b").kind, "network");
+  assert.equal(explainFailure(Object.assign(new Error("bad input"), { status: 400, fix: "do x" }), "https://b").kind, "error");
+  // A plain need()/validation error (no status, plain Error) must NOT be mistaken for a network failure.
+  assert.equal(explainFailure(new Error("workId is required"), "https://b").kind, "error");
+});
+
+test("an expired/invalid token yields a re-init/login next step, not a bare 401", async () => {
+  const client = { getItem: async () => { throw Object.assign(new Error("unauthorized"), { status: 401 }); } };
+  const errs = [];
+  const code = await run(["get", "item-1"], { client, env: { PULLBOARD_TOKEN: "t" }, loadConfig: () => ({}), error: (m) => errs.push(m) });
+  assert.equal(code, 1);
+  const joined = errs.join("\n");
+  assert.ok(joined.includes("expired") || joined.includes("invalid"), "names the real cause");
+  assert.ok(joined.includes("pullboard init"), "points at re-provisioning");
+  assert.ok(joined.includes("pullboard login"), "offers the login path too");
+});
+
+test("a network/offline failure says the board is unreachable, not that the token is bad", async () => {
+  const client = { getItem: async () => { throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } }); } };
+  const errs = [];
+  const code = await run(["get", "item-1"], { client, env: { PULLBOARD_TOKEN: "t" }, loadConfig: () => ({}), error: (m) => errs.push(m) });
+  assert.equal(code, 1);
+  const joined = errs.join("\n");
+  assert.ok(joined.includes("can't reach the board"), "diagnoses connectivity, not auth");
+  assert.ok(joined.includes("ECONNREFUSED"), "keeps the underlying cause for debugging");
+});
+
+test("a 429 tells the agent to slow down and retry", async () => {
+  const client = { getItem: async () => { throw Object.assign(new Error("too many requests"), { status: 429, retryAfter: "5" }); } };
+  const errs = [];
+  const code = await run(["get", "item-1"], { client, env: { PULLBOARD_TOKEN: "t" }, loadConfig: () => ({}), error: (m) => errs.push(m) });
+  assert.equal(code, 1);
+  const joined = errs.join("\n");
+  assert.ok(joined.includes("rate-limited"), "names it");
+  assert.ok(joined.includes("slow down"), "tells the agent what to do");
+  assert.ok(joined.includes("5"), "surfaces the retry-after hint when present");
+});
+
+test("a Node older than 18 fails with a plain upgrade instruction, not 'fetch is not defined'", async () => {
+  const errs = [];
+  const code = await run(["status"], { nodeVersion: "16.20.2", env: { PULLBOARD_TOKEN: "t" }, loadConfig: () => ({}), error: (m) => errs.push(m) });
+  assert.equal(code, 1);
+  assert.ok(errs[0].includes("Node 16.20.2 is too old"), "names the running version");
+  assert.ok(errs.join("\n").includes("Node 18"), "states the requirement");
+});
+
+test("onboard still reads on old Node (the offline guide needs no fetch)", async () => {
+  const out = [];
+  const code = await run(["onboard"], { nodeVersion: "14.0.0", env: {}, log: (m) => out.push(m) });
+  assert.equal(code, 0);
+  assert.match(out[0], /how to drive the board/i);
+});
+
+test("whoami reports config, identity, and connectivity — and never prints the full token", async () => {
+  const out = [];
+  const client = stubClient({ status: { firstContact: { principalId: "agent:me" }, project: { name: "Default project", projectId: "p1" }, counts: { active: 3, total: 9 } } });
+  const code = await run(["whoami"], { client, env: { PULLBOARD_TOKEN: "supersecrettoken1234" }, loadConfig: () => ({}), log: (m) => out.push(m) });
+  assert.equal(code, 0);
+  const joined = out.join("\n");
+  assert.ok(joined.includes("board url:"), "reports config");
+  assert.ok(joined.includes("env:PULLBOARD_TOKEN"), "reports the token source");
+  assert.ok(joined.includes("agent:me"), "reports the principal identity");
+  assert.ok(joined.includes("Default project"), "reports the project");
+  assert.ok(joined.includes("connectivity:  OK"), "reports token/connectivity state");
+  assert.ok(!joined.includes("supersecrettoken1234"), "the secret is masked, never printed in full");
+});
+
+test("whoami surfaces a friendly failure when the board rejects the token", async () => {
+  const out = [];
+  const errs = [];
+  const client = stubClient({ statusThrows: true });
+  const code = await run(["whoami"], { client, env: { PULLBOARD_TOKEN: "t" }, loadConfig: () => ({}), log: (m) => out.push(m), error: (m) => errs.push(m) });
+  assert.equal(code, 1);
+  assert.ok(out.join("\n").includes("connectivity:  FAILED"), "flags the connectivity problem");
+  assert.ok(errs.join("\n").includes("expired") || errs.join("\n").includes("rejected"), "gives the actionable cause");
+});
+
+test("doctor distinguishes an unreachable board from a rejected token", async () => {
+  const errsNet = [];
+  const netClient = { getStatus: async () => { throw Object.assign(new TypeError("fetch failed"), { cause: { code: "ENOTFOUND" } }); } };
+  await run(["doctor"], { client: netClient, env: { PULLBOARD_TOKEN: "t" }, loadConfig: () => ({}), error: (m) => errsNet.push(m) });
+  assert.ok(errsNet.join("\n").includes("unreachable"), "network failure reads as unreachable, not a bad token");
+  const errsAuth = [];
+  const authClient = { getStatus: async () => { throw Object.assign(new Error("nope"), { status: 401 }); } };
+  await run(["doctor"], { client: authClient, env: { PULLBOARD_TOKEN: "t" }, loadConfig: () => ({}), error: (m) => errsAuth.push(m) });
+  assert.ok(errsAuth.join("\n").includes("rejected your token"), "auth failure reads as a token problem");
+});
+
+test("login validates the token against the board and saves it locally", async () => {
+  const saved = [];
+  const out = [];
+  const client = stubClient({ status: { firstContact: { principalId: "agent:me" }, counts: { active: 1, total: 2 } } });
+  const code = await run(["login", "tok-xyz"], { client, saveConfig: (c) => saved.push(c), loadConfig: () => ({}), env: {}, log: (m) => out.push(m) });
+  assert.equal(code, 0);
+  assert.deepEqual(saved[0], { baseUrl: "https://pullboard.dev", token: "tok-xyz" }, "persists baseUrl + token");
+  assert.ok(out.some((m) => m.includes("logged in")), "confirms success");
+  assert.ok(out.some((m) => m.includes("agent:me")), "shows which identity you logged in as");
+});
+
+test("login rejects a token the board does not accept and saves nothing", async () => {
+  const saved = [];
+  const errs = [];
+  const client = stubClient({ statusThrows: true });
+  const code = await run(["login", "bad-token"], { client, saveConfig: (c) => saved.push(c), loadConfig: () => ({}), env: {}, error: (m) => errs.push(m) });
+  assert.equal(code, 1);
+  assert.equal(saved.length, 0, "a bad token is never persisted");
+  assert.ok(errs[0].includes("not accepted"), "says the token was rejected");
+});
+
+test("login with no token tells you how to get one", async () => {
+  const errs = [];
+  const code = await run(["login"], { loadConfig: () => ({}), env: {}, error: (m) => errs.push(m) });
+  assert.equal(code, 1);
+  assert.ok(errs[0].includes("paste a token"), "prompts for the token");
+  assert.ok(errs.join("\n").includes("pullboard init"), "points to where to get one");
 });

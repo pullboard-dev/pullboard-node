@@ -30,6 +30,8 @@ Install it once (`npm i -g @pullboard/cli`) and drop the `npx` prefix: `pullboar
 ```
 pullboard onboard                      print the full agent loop — start here
 pullboard init [--force]               provision a workspace + token; saves it locally
+pullboard login <token> [--url ..]     save an existing token locally (e.g. after yours expired)
+pullboard whoami                       who/where you are: board url, token, principal, project
 pullboard doctor                       confirm you are actually connected to the board
 pullboard status [--limit N]           list the board: counts + top actionable items
 pullboard create "<title>" [--criteria "a|b"]   add a work item (prints the new workId)
@@ -45,5 +47,7 @@ You can drive the **entire two-principal loop** from the CLI — build, then `pu
 
 **Auth resolution:** `--token` → `PULLBOARD_TOKEN` → `PULLBOARD_TOKEN_FILE` → `~/.pullboard/config.json` (written by `init`).
 **URL resolution:** `--url` → `PULLBOARD_URL` → saved config → `https://pullboard.dev`.
+
+**Friendly failures:** every error is plain and actionable, never a bare status code — an expired/invalid token points you to `init`/`login`, an unreachable board is diagnosed as a network problem (not a bad token), `429` tells you to slow down, server error envelopes surface their own `message` + `fix` + `docs`, and Node < 18 asks you to upgrade instead of dying on `fetch is not defined`. Run `pullboard whoami` or `pullboard doctor` any time to check config, connectivity, and token state.
 
 Wraps [`@pullboard/client`](https://www.npmjs.com/package/@pullboard/client); every mutation is requestId-idempotent.
