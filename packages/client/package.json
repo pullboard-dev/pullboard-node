@@ -1,6 +1,6 @@
 {
   "name": "@pullboard/client",
-  "version": "0.3.1",
+  "version": "0.4.1",
   "description": "Thin JavaScript client for the Pullboard coordination API — claim, submit, verify, and anonymous provisioning, requestId-idempotent.",
   "license": "MIT",
   "type": "module",
@@ -14,6 +14,7 @@
   "engines": { "node": ">=18" },
   "publishConfig": { "access": "public" },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "prepublishOnly": "node ../../scripts/check-versions.mjs"
   }
 }

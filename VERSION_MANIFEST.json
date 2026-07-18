@@ -1,0 +1,48 @@
+{
+  "canonicalVersion": "0.4.1",
+  "policy": "Every externally-published Pullboard surface shares ONE version. This is an operator convention, not a semver consequence: bump them together on every release, even a surface whose own code did not change this cycle. The single value below is the source of truth. To release, bump ONLY this field plus the version fields it governs, then run the pre-release check.",
+  "preReleaseCheck": "node scripts/check-surface-versions.mjs  (run from the pullboard-node repo root, with the sibling repos checked out next to it)",
+  "siblingRepoRoot": "..",
+  "surfaces": [
+    {
+      "id": "npm:@pullboard/client",
+      "channel": "npm",
+      "repo": "pullboard-node",
+      "versionFile": "packages/client/package.json",
+      "type": "package.json"
+    },
+    {
+      "id": "npm:@pullboard/cli",
+      "channel": "npm",
+      "repo": "pullboard-node",
+      "versionFile": "packages/cli/package.json",
+      "type": "package.json",
+      "internalDeps": ["@pullboard/client"]
+    },
+    {
+      "id": "npm:pullboard",
+      "channel": "npm",
+      "repo": "pullboard-node",
+      "versionFile": "packages/pullboard/package.json",
+      "type": "package.json",
+      "internalDeps": ["@pullboard/cli"]
+    },
+    {
+      "id": "clawhub:@pullboard/openclaw-pullboard",
+      "channel": "clawhub",
+      "repo": "pullboard-openclaw",
+      "versionFile": "package.json",
+      "type": "package.json"
+    },
+    {
+      "id": "pypi:pullboard",
+      "channel": "pypi",
+      "repo": "pullboard-python",
+      "versionFile": "pyproject.toml",
+      "type": "pyproject.toml",
+      "extraVersionFiles": [
+        { "path": "src/pullboard/__init__.py", "type": "python-dunder" }
+      ]
+    }
+  ]
+}

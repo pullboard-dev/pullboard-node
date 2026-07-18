@@ -11,6 +11,8 @@
   "repository": { "type": "git", "url": "git+https://github.com/pullboard-dev/pullboard-node.git" },
   "bugs": { "url": "https://github.com/pullboard-dev/pullboard-node/issues" },
   "scripts": {
-    "test": "npm test --workspaces --if-present"
+    "test": "node --test test/versions.test.mjs && npm test --workspaces --if-present",
+    "check:versions": "node scripts/check-versions.mjs",
+    "check:surfaces": "node scripts/check-surface-versions.mjs"
   }
 }
